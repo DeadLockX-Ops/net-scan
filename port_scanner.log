@@ -1,0 +1,4 @@
+2025-10-04 13:42:07,405 [INFO] Scanning 192.168.1.10 (192.168.1.10) ports 1-1024 (concurrency=200)
+2025-10-04 13:42:25,517 [INFO] Active probes complete. Found 0 open-ish ports.
+2025-10-04 13:42:38,586 [INFO] Scanning scanme.nmap.org (45.33.32.156) ports 1-1024 (concurrency=200)
+2025-10-04 13:42:56,661 [INFO] Active probes complete. Found 2 open-ish ports.
