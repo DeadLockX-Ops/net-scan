@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-port_scanner.py  (enhanced)
+port_scanner_enhanced.py
 
 Async port scanner with banner grabbing, regex-based service/version detection,
-JSON/CSV export, logging, optional nmap integration (including aggressive -A),
-rate-limiting, jitter, and improved merging/printing of results.
+JSON/CSV export, logging, optional nmap integration, rate-limiting, and jitter.
 
-Preserves all functionality from the previous version and adds:
- - explicit IP vs hostname handling
- - improved nmap invocation (normal and aggressive modes)
- - better parsing of nmap -A output (ports, traceroute, OS hints, script output)
- - merging of nmap-found ports into the scanner results
- - clear terminal-style output (includes nmap summary if available)
+Usage:
+    python port_scanner_enhanced.py target [--start START] [--end END] [options]
 
-LEGAL: only scan hosts you own / have permission to scan.
+Example:
+    python port_scanner_enhanced.py 192.168.1.10 --start 1 --end 1024 --json results.json --csv results.csv
+
+Requirements:
+    - Python 3.8+
+    - If using --use-nmap, ensure `nmap` is installed and on PATH.
+
+Legal:
+    Only scan systems you own or have permission to scan.
 """
+
 import argparse
 import asyncio
 import csv
@@ -27,48 +31,81 @@ import socket
 import subprocess
 import sys
 import time
-import ipaddress
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional
 
 # ----------------------------
 # Configuration / Defaults
 # ----------------------------
+
+# Make public api explicit for imports (helpful but not required) --
+__all__ = [
+    "scan_range",
+    "analyze_results",
+    "now_ts",
+    "CONNECT_TIMEOUT",
+    "READ_TIMEOUT",
+    "DEFAULT_CONCURRENCY",
+    "DEFAULT_JITTER",
+]
+
+
 DEFAULT_START_PORT = 1
 DEFAULT_END_PORT = 1024
 DEFAULT_CONCURRENCY = 200
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 2.0
-DEFAULT_RATE_DELAY = 0.0
-DEFAULT_JITTER = 0.02
+DEFAULT_RATE_DELAY = 0.0  # base seconds between starts of tasks (adds jitter)
+DEFAULT_JITTER = 0.02  # up to this many seconds of random jitter added to rate delay
 BANNER_READ_BYTES = 2048
 LOG_FILENAME = "port_scanner.log"
 SCAN_LIMITS = {"max_port_range": 2000, "max_concurrency": 2000}
 
-# ----------------------------
-# Common Ports & Insecure Notes
-# ----------------------------
-COMMON_PORTS = {
-    20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
-    80: "http", 110: "pop3", 139: "netbios-ssn", 143: "imap", 443: "https",
-    445: "microsoft-ds", 3306: "mysql", 5432: "postgresql", 5900: "vnc", 3389: "rdp",
-    8080: "http-proxy"
-}
-
-INSECURE_NOTES = {
-    "telnet": "Telnet transmits credentials in cleartext. Prefer SSH.",
-    "ftp": "FTP is unencrypted — prefer SFTP/FTPS.",
-    "http": "HTTP is unencrypted. Prefer HTTPS.",
-    "mysql": "Database port exposed — restrict access, use strong auth and firewalling.",
-    "vnc": "VNC may allow unauthenticated access if misconfigured.",
-    "rdp": "Exposed RDP is frequently targeted — use VPN or RDP gateway.",
-    "microsoft-ds": "SMB/Windows sharing should be restricted; legacy SMBv1 is insecure.",
-}
 
 # ----------------------------
-# Banner Signatures (Regex)
+# Formatting JSON results to Human-Readable Text
+# ----------------------------
+
+def format_scan_results(results_json):
+    """
+    Turn the scan JSON dict into a human-readable terminal-style report (plain text).
+    """
+    import datetime
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"Scan report for {results_json.get('target')} ({results_json.get('resolved_ip')})")
+    lines.append(f"Port range: {results_json.get('start')}-{results_json.get('end')}")
+    ts = results_json.get("scanned_at")
+    try:
+        ts_str = datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts_str = str(ts)
+    lines.append(f"Scanned at: {ts_str}")
+    lines.append(f"Found {len(results_json.get('results', []))} open ports\n")
+
+    for r in results_json.get("results", []):
+        port = r.get("port")
+        service = r.get("detected_service") or "unknown"
+        rtt = r.get("rtt_ms", 0.0)
+        lines.append(f"- Port {port:5d} | Service: {service:12} | RTT: {rtt:.1f} ms")
+        if r.get("insecure_note"):
+            lines.append(f"    ⚠ {r['insecure_note']}")
+        if r.get("banner"):
+            banner_lines = [ln.strip() for ln in r["banner"].splitlines() if ln.strip()]
+            snippet = " | ".join(banner_lines[:3])
+            if snippet:
+                lines.append(f"    Banner: {snippet}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+# ----------------------------
+
+# ----------------------------
+# Service fingerprint database (regex based)
+# Expand this DB to add more signatures as needed.
 # ----------------------------
 BANNER_SIGNATURES = [
+    # (service_name, regex_pattern, optional description_template)
     ("ssh", re.compile(r"^SSH-(?P<version>[\d\.]+).*", re.IGNORECASE), "OpenSSH {version}"),
     ("http", re.compile(r"(?i)http/\d\.\d"), "HTTP"),
     ("apache", re.compile(r"(?i)apache/?(?P<version>[\d\.]+)?"), "Apache {version}"),
@@ -83,13 +120,46 @@ BANNER_SIGNATURES = [
     ("telnet", re.compile(r"(?i)telnet"), "Telnet"),
     ("mongodb", re.compile(r"(?i)mongo(db)?"), "MongoDB"),
     ("redis", re.compile(r"(?i)redis"), "Redis"),
+    # Add more tailored signatures as you gather more banners
 ]
 
+# Map common ports to service hints and warnings for quick notes
+COMMON_PORTS = {
+    20: "ftp-data",
+    21: "ftp",
+    22: "ssh",
+    23: "telnet",
+    25: "smtp",
+    53: "dns",
+    80: "http",
+    110: "pop3",
+    139: "netbios-ssn",
+    143: "imap",
+    443: "https",
+    445: "microsoft-ds",
+    3306: "mysql",
+    5432: "postgresql",
+    5900: "vnc",
+    3389: "rdp",
+    8080: "http-proxy",
+}
+
+INSECURE_NOTES = {
+    "telnet": "Telnet transmits credentials in cleartext. Prefer SSH.",
+    "ftp": "FTP is unencrypted — prefer SFTP/FTPS.",
+    "http": "HTTP is unencrypted. Prefer HTTPS.",
+    "mysql": "Database port exposed — restrict access, use strong auth and firewalling.",
+    "vnc": "VNC may allow unauthenticated access if misconfigured.",
+    "rdp": "Exposed RDP is frequently targeted — use VPN or RDP gateway.",
+    "microsoft-ds": "SMB/Windows sharing should be restricted; legacy SMBv1 is insecure.",
+}
+
 # ----------------------------
-# Utilities
+# Utility functions
 # ----------------------------
 def now_ts() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
 
 def setup_logging(log_file: str = LOG_FILENAME, level=logging.INFO):
     logging.basicConfig(
@@ -101,28 +171,20 @@ def setup_logging(log_file: str = LOG_FILENAME, level=logging.INFO):
         ],
     )
 
-def resolve_host(host: str) -> Optional[str]:
-    """
-    If input is already a valid IP, return it. Otherwise resolve the hostname.
-    Returns string IP or None on failure.
-    """
-    try:
-        ipaddress.ip_address(host)
-        logging.info("Input is a valid IP address: %s", host)
-        return host
-    except ValueError:
-        pass
 
+def resolve_host(host: str) -> Optional[str]:
     try:
-        info = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-        addr = info[0][4][0]
-        logging.info("Resolved hostname %s to IP %s", host, addr)
-        return addr
+        return socket.gethostbyname(host)
     except Exception as e:
         logging.error("Host resolution failed for %s: %s", host, e)
         return None
 
+
 def match_banner_signatures(banner: str) -> Dict[str, Optional[str]]:
+    """
+    Try to match banner against our signatures.
+    Returns dict with keys: 'service', 'description'
+    """
     if not banner:
         return {"service": None, "description": None}
     b = banner.strip()
@@ -131,38 +193,66 @@ def match_banner_signatures(banner: str) -> Dict[str, Optional[str]]:
         if m:
             version = None
             try:
-                version = m.groupdict().get("version") if m.groupdict() else None
+                version = m.groupdict().get("version") or m.groupdict().get("v") or None
             except Exception:
                 version = None
-            desc = desc_tpl.format(version=version) if version else desc_tpl.split("{")[0].strip()
+            if version:
+                try:
+                    desc = desc_tpl.format(version=version)
+                except Exception:
+                    desc = desc_tpl
+            else:
+                desc = desc_tpl.split("{")[0].strip()
             return {"service": svc, "description": desc}
+    # heuristics: look for plain words
     low = b.lower()
-    if "http" in low: return {"service": "http", "description": "HTTP"}
-    if "ssh" in low: return {"service": "ssh", "description": "SSH"}
-    if "smtp" in low or "esmtp" in low: return {"service": "smtp", "description": "SMTP"}
+    if "http" in low:
+        return {"service": "http", "description": "HTTP"}
+    if "ssh" in low:
+        return {"service": "ssh", "description": "SSH"}
+    if "smtp" in low or "esmtp" in low:
+        return {"service": "smtp", "description": "SMTP"}
     return {"service": None, "description": None}
 
+
 # ----------------------------
-# Async Port Probe
+# Async port probe
 # ----------------------------
 async def probe_port(
-    host: str, port: int, semaphore: asyncio.Semaphore,
-    connect_timeout: float, read_timeout: float, rate_delay: float, jitter: float
+    host: str,
+    port: int,
+    semaphore: asyncio.Semaphore,
+    connect_timeout: float,
+    read_timeout: float,
+    rate_delay: float,
+    jitter: float,
 ) -> Optional[Dict]:
+    """
+    Attempt to connect, optionally send a small probe, read banner.
+    Returns None on closed/refused/error. Otherwise returns a dict with port, banner, elapsed_ms.
+    """
     await asyncio.sleep(rate_delay + random.uniform(0, jitter))
     async with semaphore:
         start = time.perf_counter()
         try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=connect_timeout)
+            # create TCP connection
+            fut = asyncio.open_connection(host, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=connect_timeout)
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
+            # closed or filtered or refused
             return None
+        except Exception as e:
+            logging.debug("Unhandled connect exception for %s:%d %s", host, port, e)
+            return None
+
         banner = ""
         try:
-            # send a small probe: HEAD for web, newline otherwise
+            # For HTTP-like ports, send a HEAD to elicit a server header
             try:
                 if port in (80, 8080, 8000, 8888):
                     writer.write(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
                 else:
+                    # a newline can sometimes trigger an initial banner
                     writer.write(b"\r\n")
                 await writer.drain()
             except Exception:
@@ -170,12 +260,15 @@ async def probe_port(
 
             try:
                 data = await asyncio.wait_for(reader.read(BANNER_READ_BYTES), timeout=read_timeout)
-                banner = data.decode(errors="replace").strip() if data else ""
+                if data:
+                    banner = data.decode(errors="replace").strip()
             except asyncio.TimeoutError:
+                # no banner returned within read timeout is still a valid open port
                 banner = ""
             except Exception:
                 banner = ""
         finally:
+            # close writer
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -185,54 +278,279 @@ async def probe_port(
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return {"port": port, "banner": banner, "elapsed_ms": elapsed_ms}
 
+
 # ----------------------------
-# Async Scan Range
+# Nmap integration (optional)
 # ----------------------------
-async def scan_range(host: str, start_port: int, end_port: int, concurrency: int,
-                     connect_timeout: float, read_timeout: float, rate_delay: float, jitter: float
-) -> Tuple[str, List[Dict]]:
+import os
+import shutil
+import subprocess
+import logging
+from typing import Optional
+
+def run_nmap_service_scan(target: str, ports: str = "1-1024", aggressive: bool = False, timeout: int = 900) -> Optional[str]:
+    """
+    Run nmap on target. Attempts to adapt flags when running unprivileged.
+    Returns nmap stdout (with appended stderr if non-zero exit), or None if nmap is absent.
+    """
+    nmap_bin = shutil.which("nmap")
+    if not nmap_bin:
+        logging.warning("nmap not found on PATH. Skipping nmap scan.")
+        return None
+
+    # Heuristic: raw SYN (-sS) is likely only possible when running as root.
+    can_do_sS = False
+    try:
+        can_do_sS = (os.geteuid() == 0)
+    except Exception:
+        can_do_sS = False
+
+    # Base pieces
+    base_args = ["-p", ports, "-Pn"]  # skip ping to avoid ICMP/firewall blocking surprises
+
+    # Build initial candidate commands (from most aggressive to most conservative)
+    commands = []
+
+    if aggressive:
+        if can_do_sS:
+            # best-effort: SYN + aggressive + OS detection
+            commands.append([nmap_bin] + base_args + ["-sS", "-A", "-O", target])
+        else:
+            # not privileged: try TCP connect but with -A and -O (may fail due to -O)
+            commands.append([nmap_bin] + base_args + ["-sT", "-A", "-O", target])
+
+            # Next fallback: remove -O (OS detect) but keep -A
+            commands.append([nmap_bin] + base_args + ["-sT", "-A", target])
+
+            # Next fallback: safe aggressive scan for unprivileged containers
+            commands.append([
+                nmap_bin,
+                *base_args,
+                "-sT", "-sV",
+                "--script", "default,vuln",
+                "--version-intensity", "9",
+                target
+            ])
+
+    else:
+        # non-aggressive: prefer service/version detection
+        if can_do_sS:
+            commands.append([nmap_bin] + base_args + ["-sV", "--version-intensity", "0", target])
+        else:
+            commands.append([nmap_bin] + base_args + ["-sT", "-sV", "--version-intensity", "0", target])
+
+    # Run through candidate commands until one succeeds or we exhaust options.
+    last_stdout = ""
+    last_stderr = ""
+    for idx, cmd in enumerate(commands):
+        logging.info("Attempting nmap candidate %d: %s", idx + 1, " ".join(cmd))
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            last_stdout, last_stderr = stdout, stderr
+
+            if proc.returncode == 0:
+                logging.info("nmap candidate %d succeeded.", idx + 1)
+                return stdout
+            else:
+                # If permission-related failure, log it and continue to next fallback
+                combined = (stderr + "\n" + stdout).lower()
+                if "operation not permitted" in combined or "socket troubles" in combined or "permission denied" in combined:
+                    logging.warning("nmap candidate %d failed with permission error; will try a less-privileged command.", idx + 1)
+                    logging.debug("nmap stderr: %s", stderr)
+                    # try next candidate
+                    continue
+                else:
+                    # non-permission failure — log and still try next candidate if available
+                    logging.warning("nmap candidate %d returned non-zero exit %s; stderr: %s", idx + 1, proc.returncode, stderr.strip())
+                    continue
+        except subprocess.TimeoutExpired:
+            logging.error("nmap candidate %d timed out after %s seconds", idx + 1, timeout)
+            last_stdout += "\n\n# nmap timeout"
+            continue
+        except Exception as exc:
+            logging.exception("Exception while running nmap candidate %d: %s", idx + 1, exc)
+            last_stdout += f"\n\n# exception: {exc}"
+            continue
+
+    # If we reached here, all commands failed. Return best-effort output (stdout + stderr) for debugging.
+    combined_out = (last_stdout or "") + ("\n\n# nmap stderr:\n" + (last_stderr or "")) if (last_stdout or last_stderr) else None
+    logging.error("All nmap attempts failed. Returning combined output for debugging.")
+    return combined_out
+
+
+def parse_nmap_simple(nmap_output: str) -> List[Dict]:
+    """
+    Very simple parser for nmap -sV output to harvest found open ports and service lines.
+    This is intentionally minimal and best-effort.
+    """
+    results = []
+    if not nmap_output:
+        return results
+    # Nmap has a table like:
+    # PORT     STATE SERVICE VERSION
+    # 22/tcp   open  ssh     OpenSSH 7.6p1 Ubuntu
+    lines = nmap_output.splitlines()
+    in_table = False
+    for line in lines:
+        if re.match(r"PORT\s+STATE\s+SERVICE", line):
+            in_table = True
+            continue
+        if in_table:
+            line = line.strip()
+            if not line:
+                break
+            # Example: "22/tcp open ssh OpenSSH 7.6p1 Ubuntu"
+            m = re.match(r"(\d+)\/tcp\s+(\S+)\s+(\S+)\s*(.*)$", line)
+            if m:
+                port = int(m.group(1))
+                state = m.group(2)
+                service = m.group(3)
+                version = m.group(4).strip()
+                results.append({"port": port, "state": state, "service": service, "version": version})
+    return results
+
+
+# ----------------------------
+# Reporting / Export
+# ----------------------------
+def export_json(path: str, host: str, ip: str, start: int, end: int, scan_results: List[Dict]):
+    payload = {
+        "scanned_at": now_ts(),
+        "target": host,
+        "resolved_ip": ip,
+        "port_range": {"start": start, "end": end},
+        "results": scan_results,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    logging.info("Saved JSON report to %s", path)
+
+
+def export_csv(path: str, host: str, ip: str, scan_results: List[Dict]):
+    fieldnames = [
+        "scanned_at",
+        "target",
+        "resolved_ip",
+        "port",
+        "state",
+        "service_hint",
+        "detected_service",
+        "version",
+        "banner_snippet",
+        "insecure_note",
+        "rtt_ms",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        scanned_at = now_ts()
+        for r in scan_results:
+            writer.writerow(
+                {
+                    "scanned_at": scanned_at,
+                    "target": host,
+                    "resolved_ip": ip,
+                    "port": r.get("port"),
+                    "state": r.get("state"),
+                    "service_hint": r.get("service_hint"),
+                    "detected_service": r.get("detected_service"),
+                    "version": r.get("version"),
+                    "banner_snippet": (r.get("banner") or "").replace("\n", " | ")[:500],
+                    "insecure_note": r.get("insecure_note") or "",
+                    "rtt_ms": round(r.get("rtt_ms", 0), 2),
+                }
+            )
+    logging.info("Saved CSV report to %s", path)
+
+
+# ----------------------------
+# Main scan orchestration
+# ----------------------------
+async def scan_range(
+    host: str,
+    start_port: int,
+    end_port: int,
+    concurrency: int,
+    connect_timeout: float,
+    read_timeout: float,
+    rate_delay: float,
+    jitter: float,
+):
+    """
+    Perform async probes across the given port range. Returns list of result dicts.
+    """
     ip = resolve_host(host)
     if not ip:
         raise RuntimeError(f"Could not resolve host {host}")
+
     logging.info("Scanning %s (%s) ports %d-%d (concurrency=%d)", host, ip, start_port, end_port, concurrency)
     sem = asyncio.Semaphore(concurrency)
-    tasks = [asyncio.create_task(probe_port(host, p, sem, connect_timeout, read_timeout, rate_delay, jitter))
-             for p in range(start_port, end_port + 1)]
+
+    tasks = []
+    # to avoid creating 65k coroutines at once, chunk the range in reasonable batches
+    ports = list(range(start_port, end_port + 1))
+    for p in ports:
+        # small incremental rate control: stagger start times via rate_delay + jitter inside probe
+        task = asyncio.create_task(
+            probe_port(host, p, sem, connect_timeout, read_timeout, rate_delay, jitter)
+        )
+        tasks.append(task)
+
+    # gather with return_exceptions=False so exceptions bubble (we'll catch below)
     results = []
     for fut in asyncio.as_completed(tasks):
         try:
             res = await fut
-            if res:
-                results.append(res)
         except Exception as e:
             logging.debug("Probe raised: %s", e)
+            continue
+        if res:
+            # res contains port, banner, elapsed_ms
+            results.append(res)
     logging.info("Active probes complete. Found %d open-ish ports.", len(results))
     return ip, results
 
+
 def run_scan_sync(host: str, start: int, end: int, concurrency: int,
                   connect_timeout: float = CONNECT_TIMEOUT, read_timeout: float = READ_TIMEOUT,
-                  rate_delay: float = DEFAULT_RATE_DELAY, jitter: float = DEFAULT_JITTER) -> Tuple[str, List[Dict]]:
+                  rate_delay: float = DEFAULT_RATE_DELAY, jitter: float = DEFAULT_JITTER):
+    """
+    Helper to run the async scan_range from synchronous code (e.g. Flask).
+    Returns (ip, raw_results) or raises an exception on failure.
+    """
     return asyncio.run(scan_range(host, start, end, concurrency, connect_timeout, read_timeout, rate_delay, jitter))
 
-# ----------------------------
-# Results Analysis
-# ----------------------------
+
+
 def analyze_results(raw_results: List[Dict]) -> List[Dict]:
+    """
+    Enrich raw probe results with service detection, hints, notes.
+    """
     enriched = []
     for r in raw_results:
         port = r.get("port")
         banner = r.get("banner", "") or ""
         rtt = r.get("elapsed_ms", 0.0)
+
+        # quick hint from known common ports
         service_hint = COMMON_PORTS.get(port)
+
+        # signature-based detection
         sig = match_banner_signatures(banner)
         detected_service = sig.get("service") or service_hint or "unknown"
         description = sig.get("description")
+
+        # try to parse version from banner heuristics
         version = None
         if description and " " in description:
+            # if description like "OpenSSH 7.6p1", attempt to capture numbers
             m = re.search(r"(\d+(?:\.\d+)+)", description)
             if m:
                 version = m.group(1)
         else:
+            # try to find version-like pattern in banner
             m = re.search(r"v(?:ersion)?\s*[:/]?\s*(\d+(?:\.\d+)+)", banner, re.IGNORECASE)
             if m:
                 version = m.group(1)
@@ -240,465 +558,81 @@ def analyze_results(raw_results: List[Dict]) -> List[Dict]:
                 m2 = re.search(r"([\w-]+)[/ ]([\d\.]+)", banner)
                 if m2:
                     version = m2.group(2)
-        insecure_note = INSECURE_NOTES.get(detected_service) or INSECURE_NOTES.get(service_hint)
-        enriched.append({
-            "port": port,
-            "state": "open",
-            "service_hint": service_hint,
-            "detected_service": detected_service,
-            "version": version,
-            "banner": banner,
-            "insecure_note": insecure_note,
-            "rtt_ms": rtt,
-        })
+
+        insecure_note = INSECURE_NOTES.get(detected_service) or INSECURE_NOTES.get(service_hint, None)
+
+        enriched.append(
+            {
+                "port": port,
+                "state": "open",
+                "service_hint": service_hint,
+                "detected_service": detected_service,
+                "version": version,
+                "banner": banner,
+                "insecure_note": insecure_note,
+                "rtt_ms": rtt,
+            }
+        )
+    # Sort by port number
     enriched.sort(key=lambda x: x["port"])
     return enriched
 
-# ----------------------------
-# JSON/CSV Export
-# ----------------------------
-def export_json(path: str, host: str, ip: str, start: int, end: int, scan_results: List[Dict]):
-    payload = {"scanned_at": now_ts(), "target": host, "resolved_ip": ip,
-               "port_range": {"start": start, "end": end}, "results": scan_results}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    logging.info("Saved JSON report to %s", path)
 
-def export_csv(path: str, host: str, ip: str, scan_results: List[Dict]):
-    fieldnames = ["scanned_at", "target", "resolved_ip", "port", "state", "service_hint",
-                  "detected_service", "version", "banner_snippet", "insecure_note", "rtt_ms"]
-    with open(path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        scanned_at = now_ts()
-        for r in scan_results:
-            writer.writerow({
-                "scanned_at": scanned_at, "target": host, "resolved_ip": ip,
-                "port": r.get("port"), "state": r.get("state"), "service_hint": r.get("service_hint"),
-                "detected_service": r.get("detected_service"), "version": r.get("version"),
-                "banner_snippet": (r.get("banner") or "").replace("\n", " | ")[:500],
-                "insecure_note": r.get("insecure_note") or "", "rtt_ms": round(r.get("rtt_ms", 0), 2)
-            })
-    logging.info("Saved CSV report to %s", path)
-
-
-def format_scan_results(result_obj: Dict) -> str:
-    """
-    Produce a plain-text formatted scan report from the result object produced
-    by run_scan_task / run_scan_sync + analyze_results in app.py.
-
-    If result_obj contains a parsed nmap dict under the key "_nmap", include
-    a formatted Nmap OS & Network Information block.
-    """
-    host = result_obj.get("target", "<unknown>")
-    ip = result_obj.get("resolved_ip", "<unknown>")
-    start = result_obj.get("start", DEFAULT_START_PORT)
-    end = result_obj.get("end", DEFAULT_END_PORT)
-    results = result_obj.get("results", [])
-    scanned_at = result_obj.get("scanned_at")
-    try:
-        ts_str = datetime.utcfromtimestamp(float(scanned_at)).strftime("%Y-%m-%d %H:%M:%S") + " UTC" if scanned_at else now_ts()
-    except Exception:
-        ts_str = now_ts()
-
-    lines = []
-    lines.append("=" * 60)
-    lines.append(f"Scan report for {host} ({ip})")
-    lines.append(f"Port range: {start}-{end}")
-    lines.append(f"Scanned at: {ts_str}")
-    lines.append(f"Found {len(results)} open ports")
-    lines.append("")
-
-    # port lines
-    for r in results:
-        port = r.get("port")
-        svc = r.get("detected_service") or r.get("service_hint") or "unknown"
-        rtt = r.get("rtt_ms", 0.0)
-        lines.append(f"- Port {port:5d} | Service: {svc:12} | RTT {float(rtt):.1f} ms")
-        if r.get("insecure_note"):
-            lines.append(f"    ⚠ {r['insecure_note']}")
-        banner = r.get("banner") or ""
-        if banner:
-            snippet_lines = [ln.strip() for ln in banner.splitlines() if ln.strip()][:3]
-            if snippet_lines:
-                snippet = " | ".join(snippet_lines)
-                if len(snippet) > 400:
-                    snippet = snippet[:400] + "..."
-                lines.append(f"    Banner: {snippet}")
-
-    lines.append("=" * 60)
-
-    # If Nmap info present, append a full Nmap block
-    nmap_info = result_obj.get("_nmap")
-    if nmap_info:
-        lines.append("")  # blank line
-        lines.append("=" * 60)
-        lines.append("Nmap OS & Network Information")
-        lines.append("=" * 60)
-        lines.append("")  # blank line
-
-        # OS Detection (raw text or a friendly fallback)
-        os_text = nmap_info.get("os_text")
-        if os_text:
-            lines.append("OS Detection: " + os_text.strip())
-        else:
-            # if os_guesses exist, don't repeat them in os_text
-            if not nmap_info.get("os_guesses"):
-                if nmap_info.get("host_up") is False:
-                    lines.append("OS Detection: Host appears down / unreachable")
-                else:
-                    lines.append("OS Detection: (no specific OS detected)")
-
-        # Aggressive OS guesses (if any)
-        if nmap_info.get("os_guesses"):
-            lines.append("Aggressive OS Guesses:")
-            for guess, pct in nmap_info.get("os_guesses", []):
-                if pct:
-                    lines.append(f"  - {guess} ({pct}%)")
-                else:
-                    lines.append(f"  - {guess}")
-
-        # Network distance & service info
-        if nmap_info.get("network_distance"):
-            # parse/print as user expects (e.g. "Network Distance: 17 hops")
-            nd = nmap_info.get("network_distance")
-            lines.append("")
-            lines.append(f"{nd}")
-        if nmap_info.get("service_info"):
-            lines.append(f"Service Info: {nmap_info.get('service_info')}")
-
-        # Ports reported by nmap (if any)
-        if nmap_info.get("ports"):
-            lines.append("")  # blank
-            lines.append("Nmap reported ports:")
-            for p in nmap_info["ports"]:
-                ver = (" " + p.get("version")) if p.get("version") else ""
-                lines.append(f"  - {p.get('port')}: {p.get('state')} {p.get('service')}{ver}")
-
-        # Traceroute (if present)
-        if nmap_info.get("traceroute"):
-            lines.append("")  # blank
-            lines.append("Traceroute (first hops):")
-            for hop in nmap_info["traceroute"][:20]:
-                lines.append(f"  {hop.get('hop'):2d}  {hop.get('rtt_ms')} ms  {hop.get('address')}")
-
-        # other small pieces
-        if nmap_info.get("other_addresses"):
-            other = nmap_info.get("other_addresses")
-            if other:
-                lines.append("")
-                lines.append("Other addresses: " + ", ".join(other))
-        if nmap_info.get("not_shown_summary"):
-            lines.append("")
-            lines.append(nmap_info.get("not_shown_summary"))
-
-        lines.append("=" * 60)
-
-    return "\n".join(lines)
-
-
-
-# ----------------------------
-# Report Printing
-# ----------------------------
-def print_report(host: str, ip: str, start: int, end: int,
-                 results_enriched: List[Dict], nmap_info: Optional[Dict] = None):
-    # header
+def print_report(host: str, ip: str, start: int, end: int, results_enriched: List[Dict]):
     print("=" * 60)
-    print(f"Scan report for {host} ({ip})")
-    print(f"Port range: {start}-{end}")
-    print(f"Scanned at: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"Scan report for {host} ({ip}) ports {start}-{end}")
+    print(f"Scanned at: {now_ts()}")
     print(f"Found {len(results_enriched)} open ports\n")
-
-    # ports discovered by our async scanner + merged nmap entries
     for r in results_enriched:
-        svc = r.get('detected_service') or r.get('service_hint') or 'unknown'
-        print(f"- Port {r['port']:5d} | Service: {svc:12} | RTT {r.get('rtt_ms', 0.0):.1f} ms")
+        print(f"- Port {r['port']:5d} | Service: {r['detected_service'] or 'unknown':12} | RTT {r['rtt_ms']:.1f} ms")
         if r.get("insecure_note"):
             print(f"    ⚠ {r['insecure_note']}")
         if r.get("banner"):
-            snippet = " | ".join([ln.strip() for ln in r["banner"].splitlines() if ln.strip()][:3])
+            lines = [ln.strip() for ln in r["banner"].splitlines() if ln.strip()]
+            snippet = " | ".join(lines[:3])
             if snippet:
                 print(f"    Banner: {snippet}")
-
-    
-    # If nmap info exists, print a full Nmap OS & Network Information block
-    if nmap_info:
-        lines = []
-        print("\n" + "=" * 60)
-        print("Nmap OS & Network Information")
-        print("=" * 60)
-        print("")  # blank line
-
-        # OS Detection (prefer os_text; fallback messaging if absent)
-        os_text = nmap_info.get("os_text")
-        if os_text:
-            print(f"OS Detection: {os_text.strip()}")
-        else:
-            # if os_guesses exist, we will list them below; otherwise print fallback
-            if nmap_info.get("os_guesses"):
-                print("OS Detection: (see Aggressive OS Guesses below)")
-            else:
-                # show host_up status if available
-                host_up = nmap_info.get("host_up")
-                if host_up is False:
-                    print("OS Detection: Host appears down / unreachable")
-                else:
-                    print("OS Detection: (no specific OS detected)")
-
-        # Aggressive OS guesses (structured)
-        if nmap_info.get("os_guesses"):
-            print("\nAggressive OS Guesses:")
-            for guess, pct in nmap_info.get("os_guesses", []):
-                if pct:
-                    print(f"  - {guess} ({pct}%)")
-                else:
-                    print(f"  - {guess}")
-
-        # Network distance & Service info
-        if nmap_info.get("network_distance"):
-            # Print exactly as your example: "Network Distance: 17 hops"
-            nd = nmap_info.get("network_distance")
-            # If parse produced whole line, print it; else format
-            if isinstance(nd, str) and "Network" in nd:
-                print("\n" + nd)
-            else:
-                print(f"\nNetwork Distance: {nd}")
-
-        if nmap_info.get("service_info"):
-            print(f"Service Info: {nmap_info.get('service_info')}")
-
-        # Ports reported by nmap (if any)
-        if nmap_info.get("ports"):
-            print("\nNmap reported ports:")
-            for p in nmap_info["ports"]:
-                ver = (" " + p.get("version")) if p.get("version") else ""
-                print(f"  - {p.get('port')}: {p.get('state')} {p.get('service')}{ver}")
-
-        # Traceroute (if present)
-        if nmap_info.get("traceroute"):
-            print("\nTraceroute (first hops):")
-            for hop in nmap_info["traceroute"][:20]:
-                print(f"  {hop.get('hop'):2d}  {hop.get('rtt_ms')} ms  {hop.get('address')}")
-
-        print("=" * 60)
-
-
-
-
-# ----------------------------
-# Nmap Integration (enhanced)
-# ----------------------------
-def run_nmap_service_scan(target: str, ports: str = "1-1024", aggressive: bool = False, timeout: int = 900) -> Optional[str]:
-    """
-    Run nmap on target. If aggressive=True, attempts to include -A and -sS,
-    but will fall back to -sT when raw sockets or privileges are not available.
-    Returns stdout (possibly with stderr appended) or None if nmap not present.
-    """
-    nmap_bin = shutil.which("nmap")
-    if not nmap_bin:
-        logging.warning("nmap binary not found in PATH. Skipping nmap scan.")
-        return None
-
-    # Heuristic: we can do -sS SYN scan if running as root (uid 0).
-    can_do_sS = False
-    try:
-        can_do_sS = (os.geteuid() == 0)
-    except Exception:
-        can_do_sS = False
-
-    cmd = [nmap_bin, "-p", ports, "-Pn"]  # -Pn skip ping, good for remote hosts
-
-    if aggressive:
-        # prefer raw SYN if possible, otherwise TCP connect
-        if can_do_sS:
-            cmd += ["-sS", "-A", "-O"]   # -A (aggressive) does version, scripts, traceroute, etc
-        else:
-            logging.warning("Not root / no raw-socket capability: falling back to -sT for aggressive nmap.")
-            cmd += ["-sT", "-A", "-O"]
-    else:
-        # non-aggressive: do service/version detection
-        cmd += ["-sV", "--version-intensity", "0"]
-
-    cmd.append(target)
-
-    logging.info("Executing nmap command: %s", " ".join(cmd))
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        output = proc.stdout or ""
-        if proc.returncode != 0:
-            output += "\n\n# nmap stderr:\n" + (proc.stderr or "")
-            logging.warning("nmap exited with code %s", proc.returncode)
-        return output
-    except subprocess.TimeoutExpired:
-        logging.error("nmap command timed out after %s seconds", timeout)
-        return None
-    except Exception as exc:
-        logging.exception("Exception while running nmap: %s", exc)
-        return None
-
-def parse_nmap_aggressive(nmap_output: str) -> Dict[str, Any]:
-    """
-    Improved parsing for nmap -A textual output (best-effort).
-    Returns a dict with:
-      - host_up (bool/None)
-      - host_latency (float seconds or None)
-      - other_addresses (list)
-      - not_shown_summary (str/None)
-      - os_text (str/None)
-      - os_guesses (list of (guess, pct) tuples)
-      - network_distance (str/None)
-      - service_info (str/None)
-      - traceroute (list of {hop, rtt_ms, address})
-      - ports (list of {port, state, service, version})
-    """
-    data: Dict[str, Any] = {
-        "host_up": None,
-        "host_latency": None,
-        "other_addresses": [],
-        "not_shown_summary": None,
-        "os_text": None,
-        "os_guesses": [],
-        "network_distance": None,
-        "service_info": None,
-        "traceroute": [],
-        "ports": []
-    }
-    if not nmap_output:
-        return data
-
-    lines = nmap_output.splitlines()
-    # helper to normalize
-    def clean(s: str) -> str:
-        return s.strip()
-
-    # Iterate lines and capture pieces
-    for i, raw in enumerate(lines):
-        line = raw.strip()
-
-        # Host up + latency
-        m_up = re.match(r"Host is up(?: \(([\d\.]+)s latency\))?", line)
-        if m_up:
-            data["host_up"] = True
-            if m_up.group(1):
-                try:
-                    data["host_latency"] = float(m_up.group(1))
-                except Exception:
-                    pass
-            continue
-
-        # Other addresses
-        m_other = re.match(r"Other addresses for .+?:\s*(.*)$", line)
-        if m_other:
-            rem = m_other.group(1).strip()
-            # may be comma separated addresses
-            addrs = [a.strip() for a in re.split(r"[,\s]+", rem) if a.strip()]
-            data["other_addresses"].extend(addrs)
-            continue
-
-        # Not shown summary
-        if line.startswith("Not shown:"):
-            data["not_shown_summary"] = line
-            continue
-
-        # Network Distance
-        if line.startswith("Network Distance:") or line.startswith("Network distance:"):
-            data["network_distance"] = line
-            continue
-
-        # Service Info
-        if line.startswith("Service Info:"):
-            data["service_info"] = line[len("Service Info:"):].strip()
-            continue
-
-        # Aggressive OS guesses line(s)
-        if line.startswith("Aggressive OS guesses:") or line.startswith("OS guesses:"):
-            # everything after colon may continue on this same line, split by commas
-            guesses_part = line.split(":", 1)[1].strip()
-            # parse comma separated guesses like "Linux 4.19 - 5.15 (94%), Linux 4.15 (90%)"
-            parts = [p.strip() for p in re.split(r",(?=\s*[A-Za-z0-9])", guesses_part) if p.strip()]
-            for p in parts:
-                m = re.match(r"(.+?)\s*\(?(\d+)%\)?$", p)
-                if m:
-                    guess = m.group(1).strip()
-                    pct = int(m.group(2))
-                    data["os_guesses"].append((guess, pct))
-                else:
-                    data["os_guesses"].append((p, None))
-            continue
-
-        # Too many fingerprints / OS detection lines
-        if "Too many fingerprints" in line or "OS details" in line or line.startswith("OS:") or line.startswith("OS guesses:"):
-            data["os_text"] = (data.get("os_text") or "") + (" " + line if data.get("os_text") else line)
-            continue
-
-        # TRACEROUTE block parsing (capture hop lines after TRACEROUTE header)
-        if line.startswith("TRACEROUTE"):
-            j = i + 1
-            while j < len(lines):
-                hop_line = lines[j].strip()
-                if not hop_line:
-                    break
-                m_hop = re.match(r"^\s*(\d+)\s+([\d\.]+)\s+ms\s+(.+)$", hop_line)
-                if m_hop:
-                    try:
-                        hop = int(m_hop.group(1))
-                        rtt = float(m_hop.group(2))
-                        addr = m_hop.group(3).strip()
-                        data["traceroute"].append({"hop": hop, "rtt_ms": rtt, "address": addr})
-                    except Exception:
-                        pass
-                j += 1
-            continue
-
-        # Ports entries e.g. "22/tcp    open  ssh    OpenSSH 6.6.1p1 Ubuntu-2ubuntu2.13"
-        m_port = re.match(r"^(\d+)\/tcp\s+(\S+)\s+(\S+)\s*(.*)$", line)
-        if m_port:
-            port = int(m_port.group(1))
-            state = m_port.group(2)
-            service = m_port.group(3)
-            version = m_port.group(4).strip() or None
-            data["ports"].append({"port": port, "state": state, "service": service, "version": version})
-            continue
-
-    return data
+    print("=" * 60)
 
 
 # ----------------------------
 # CLI
 # ----------------------------
 def build_argparser():
-    p = argparse.ArgumentParser(prog="port_scanner", description="Async Port Scanner with banner grabbing, exports and optional nmap integration")
+    p = argparse.ArgumentParser(prog="port_scanner_enhanced", description="Async Port Scanner with banner grabbing and exports")
     p.add_argument("target", help="Hostname or IP to scan")
-    p.add_argument("--start", "-s", type=int, default=DEFAULT_START_PORT)
-    p.add_argument("--end", "-e", type=int, default=DEFAULT_END_PORT)
-    p.add_argument("--concurrency", "-c", type=int, default=DEFAULT_CONCURRENCY)
-    p.add_argument("--connect-timeout", type=float, default=CONNECT_TIMEOUT)
-    p.add_argument("--read-timeout", type=float, default=READ_TIMEOUT)
-    p.add_argument("--rate-delay", type=float, default=DEFAULT_RATE_DELAY)
-    p.add_argument("--jitter", type=float, default=DEFAULT_JITTER)
+    p.add_argument("--start", "-s", type=int, default=DEFAULT_START_PORT, help=f"Start port (default {DEFAULT_START_PORT})")
+    p.add_argument("--end", "-e", type=int, default=DEFAULT_END_PORT, help=f"End port (default {DEFAULT_END_PORT})")
+    p.add_argument("--concurrency", "-c", type=int, default=DEFAULT_CONCURRENCY, help=f"Max concurrent probes (default {DEFAULT_CONCURRENCY})")
+    p.add_argument("--connect-timeout", type=float, default=CONNECT_TIMEOUT, help="TCP connect timeout seconds")
+    p.add_argument("--read-timeout", type=float, default=READ_TIMEOUT, help="Banner read timeout seconds")
+    p.add_argument("--rate-delay", type=float, default=DEFAULT_RATE_DELAY, help="Base delay (seconds) before each probe starts (adds to jitter). Default 0.0")
+    p.add_argument("--jitter", type=float, default=DEFAULT_JITTER, help="Max jitter (seconds) added randomly to each probe start")
     p.add_argument("--json", type=str, help="Path to write JSON report")
     p.add_argument("--csv", type=str, help="Path to write CSV report")
-    p.add_argument("--log", type=str, default=LOG_FILENAME)
-    p.add_argument("--verbose", action="store_true")
-    p.add_argument("--use-nmap", action="store_true", help="Run nmap and include its findings")
-    p.add_argument("--nmap-ports", default=None, help="Ports for nmap (e.g. 1-1024)")
-    p.add_argument("--no-banner", action="store_true")
-    p.add_argument("--nmap-aggressive", action="store_true", help="If using --use-nmap, run aggressive scan (-A). Requires root for full effect.")
+    p.add_argument("--log", type=str, default=LOG_FILENAME, help="Log filename")
+    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    p.add_argument("--use-nmap", action="store_true", help="If available, run nmap -sV and include its output in log (does not replace banner detection)")
+    p.add_argument("--nmap-ports", default=None, help="When using --use-nmap, specify ports for nmap (e.g. 1-1024). Default: same range as scanner")
+    p.add_argument("--no-banner", action="store_true", help="Do not attempt to read banners (faster but less info)")
     return p
 
+
 def main():
-    # interactive if no args
+    # If user runs script with no args, fall back to interactive prompts for convenience.
+    # If args are provided, keep normal argparse behavior.
     if len(sys.argv) == 1:
         try:
             host = input("Target (hostname or IP) [e.g. 127.0.0.1]: ").strip()
             if not host:
                 print("No host provided. Exiting.")
                 sys.exit(1)
-            start = int(input(f"Start port [default {DEFAULT_START_PORT}]: ").strip() or DEFAULT_START_PORT)
-            end = int(input(f"End port [default {DEFAULT_END_PORT}]: ").strip() or DEFAULT_END_PORT)
-            concurrency = int(input(f"Concurrency [default {DEFAULT_CONCURRENCY}]: ").strip() or DEFAULT_CONCURRENCY)
-            setup_logging(level=logging.INFO)
+            start = input(f"Start port [default {DEFAULT_START_PORT}]: ").strip() or str(DEFAULT_START_PORT)
+            end = input(f"End port [default {DEFAULT_END_PORT}]: ").strip() or str(DEFAULT_END_PORT)
+            concurrency = input(f"Concurrency [default {DEFAULT_CONCURRENCY}]: ").strip() or str(DEFAULT_CONCURRENCY)
+            # convert types and validate
+            start = int(start); end = int(end); concurrency = int(concurrency)
+            setup_logging(log_file=LOG_FILENAME, level=logging.INFO)
         except (EOFError, KeyboardInterrupt):
             print("\nNo input provided. Exiting.")
             sys.exit(1)
@@ -706,65 +640,79 @@ def main():
             print("Ports and concurrency must be integers. Exiting.")
             sys.exit(1)
 
+        # Safety checks
         if start < 1 or end > 65535 or start > end:
             print("Invalid port range. Use 1-65535 and ensure start <= end.")
             sys.exit(1)
+
         ip = resolve_host(host)
         if not ip:
             print(f"Could not resolve host {host}. Exiting.")
             sys.exit(1)
 
-        # run async scan
+        logging.info("Starting interactive scan of %s (%s)", host, ip)
         try:
-            ip_addr, raw_results = asyncio.run(scan_range(host, start, end, concurrency, CONNECT_TIMEOUT, READ_TIMEOUT, DEFAULT_RATE_DELAY, DEFAULT_JITTER))
+            ip_addr, raw_results = asyncio.run(
+                scan_range(host, start, end, concurrency, CONNECT_TIMEOUT, READ_TIMEOUT, DEFAULT_RATE_DELAY, DEFAULT_JITTER)
+            )
         except KeyboardInterrupt:
             logging.warning("Scan interrupted by user.")
             sys.exit(1)
+        except Exception as e:
+            logging.error("Scan failed: %s", e)
+            sys.exit(1)
+
         enriched = analyze_results(raw_results)
         print_report(host, ip_addr, start, end, enriched)
         sys.exit(0)
 
-    # CLI mode
+    # If args are present, use existing argparse flow
     args = build_argparser().parse_args()
-    setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
+    setup_logging(log_file=args.log, level=logging.DEBUG if args.verbose else logging.INFO)
 
+    # Safety checks on ports
     if args.start < 1 or args.end > 65535 or args.start > args.end:
-        sys.exit("Invalid port range.")
+        print("Invalid port range. Use 1-65535 and ensure start <= end.")
+        sys.exit(1)
+
+    # Resolve
     ip = resolve_host(args.target)
     if not ip:
-        sys.exit(f"Could not resolve {args.target}")
+        print(f"Could not resolve host {args.target}. Exiting.")
+        sys.exit(1)
 
-    nmap_info: Optional[Dict] = None
+    logging.info("Starting scan of %s (%s)", args.target, ip)
+    logging.info("Options: start=%d end=%d concurrency=%d rate_delay=%s jitter=%s", args.start, args.end, args.concurrency, args.rate_delay, args.jitter)
+
+    # Optional nmap run (non-blocking alternative: run before asyncio)
+    nmap_output = None
     if args.use_nmap:
         nmap_ports = args.nmap_ports or f"{args.start}-{args.end}"
-        logging.info("Invoking nmap (this may require privileges if you selected aggressive mode)...")
-        nmap_out = run_nmap_service_scan(args.target, ports=nmap_ports, aggressive=args.nmap_aggressive)
-        if nmap_out:
-            nmap_info = parse_nmap_aggressive(nmap_out)
-            # print nmap summary early so user sees details
-            logging.info("Nmap output captured. Parsed %d ports.", len(nmap_info.get("ports", [])))
-            print("\n=== Nmap Output Summary ===")
-            if nmap_info.get("os"):
-                print("OS:", nmap_info.get("os"))
-            if nmap_info.get("service_info"):
-                print("Service Info:", nmap_info.get("service_info"))
-            if nmap_info.get("ports"):
-                for p in nmap_info["ports"]:
-                    print(f"- Port {p['port']} {p['state']} {p['service']} {p.get('version') or ''}")
-            if nmap_info.get("traceroute"):
-                print("\nTraceroute (first hops):")
-                for hop in nmap_info["traceroute"][:6]:
-                    print(f" {hop['hop']:2d} {hop['rtt_ms']} ms {hop['address']}")
-            print("=" * 30)
+        try:
+            nmap_output = run_nmap_service_scan(args.target, ports=nmap_ports)
+            if nmap_output:
+                nmap_parsed = parse_nmap_simple(nmap_output)
+                logging.info("Parsed %d nmap entries.", len(nmap_parsed))
+                for entry in nmap_parsed:
+                    logging.info("nmap: port %s state %s service %s version %s", entry.get("port"), entry.get("state"), entry.get("service"), entry.get("version"))
+        except Exception as e:
+            logging.warning("nmap scan attempt failed: %s", e)
 
-    # run our async scanner
+    # Run asyncio scan
     try:
-        read_timeout = 0.01 if args.no_banner else args.read_timeout
-        ip_addr, raw_results = run_scan_sync(args.target, args.start, args.end, args.concurrency,
-                                             connect_timeout=args.connect_timeout,
-                                             read_timeout=read_timeout,
-                                             rate_delay=args.rate_delay,
-                                             jitter=args.jitter)
+        read_timeout = args.read_timeout
+        ip_addr, raw_results = asyncio.run(
+            scan_range(
+                args.target,
+                args.start,
+                args.end,
+                args.concurrency,
+                args.connect_timeout,
+                (0.01 if args.no_banner else read_timeout),
+                args.rate_delay,
+                args.jitter,
+            )
+        )
     except KeyboardInterrupt:
         logging.warning("Scan interrupted by user.")
         sys.exit(1)
@@ -772,32 +720,26 @@ def main():
         logging.error("Scan failed: %s", e)
         sys.exit(1)
 
+    # Analyze results
     enriched = analyze_results(raw_results)
 
-    # merge nmap-reported ports into enriched results (without losing banner info)
-    if args.use_nmap and nmap_info:
-        nm_by_port = {p["port"]: p for p in nmap_info.get("ports", [])}
-        # add/merge info
-        ports_seen = {r["port"] for r in enriched}
-        for port, nm in nm_by_port.items():
-            if port not in ports_seen:
-                # create a synthetic entry from nmap
-                enriched.append({
-                    "port": port,
-                    "state": nm.get("state", "unknown"),
-                    "service_hint": None,
-                    "detected_service": nm.get("service"),
-                    "version": nm.get("version"),
-                    "banner": None,
-                    "insecure_note": INSECURE_NOTES.get(nm.get("service")) if nm.get("service") else None,
-                    "rtt_ms": 0.0,
-                })
-        enriched.sort(key=lambda x: x["port"])
+    # If nmap results exist, try to merge version info for matching ports
+    if nmap_output:
+        parsed_nmap = parse_nmap_simple(nmap_output)
+        nm_by_port = {e["port"]: e for e in parsed_nmap}
+        for r in enriched:
+            p = r["port"]
+            if p in nm_by_port:
+                nm = nm_by_port[p]
+                if nm.get("version"):
+                    r["version"] = nm.get("version")
+                if nm.get("service"):
+                    r["detected_service"] = nm.get("service")
 
-    # print final report (includes nmap summary if present)
-    print_report(args.target, ip_addr, args.start, args.end, enriched, nmap_info)
+    # Print to terminal
+    print_report(args.target, ip_addr, args.start, args.end, enriched)
 
-    # exports
+    # Exports
     if args.json:
         try:
             export_json(args.json, args.target, ip_addr, args.start, args.end, enriched)
@@ -810,6 +752,8 @@ def main():
             logging.error("Failed to write CSV: %s", e)
 
     logging.info("Scan finished.")
+
+
 
 if __name__ == "__main__":
     main()
