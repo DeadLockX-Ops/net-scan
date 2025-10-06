@@ -489,36 +489,52 @@ def print_report(host: str, ip: str, start: int, end: int,
 # ----------------------------
 # Nmap Integration (enhanced)
 # ----------------------------
-def run_nmap_service_scan(target: str, ports: str = "1-1024", aggressive: bool = False) -> Optional[str]:
+def run_nmap_service_scan(target: str, ports: str = "1-1024", aggressive: bool = False, timeout: int = 900) -> Optional[str]:
     """
-    Run nmap. If aggressive=True, include -A -sS -O -sC -sV as appropriate.
-    Returns stdout string or None.
+    Run nmap on target. If aggressive=True, attempts to include -A and -sS,
+    but will fall back to -sT when raw sockets or privileges are not available.
+    Returns stdout (possibly with stderr appended) or None if nmap not present.
     """
     nmap_bin = shutil.which("nmap")
     if not nmap_bin:
-        logging.warning("nmap not found on PATH. Skipping nmap scan.")
+        logging.warning("nmap binary not found in PATH. Skipping nmap scan.")
         return None
 
-    # Build command
-    cmd = [nmap_bin, "-p", ports]
+    # Heuristic: we can do -sS SYN scan if running as root (uid 0).
+    can_do_sS = False
+    try:
+        can_do_sS = (os.geteuid() == 0)
+    except Exception:
+        can_do_sS = False
+
+    cmd = [nmap_bin, "-p", ports, "-Pn"]  # -Pn skip ping, good for remote hosts
+
     if aggressive:
-        # -sS (SYN) needs root. -A includes -sV -sC -O -traceroute etc.
-        # We also add -Pn to skip host discovery for consistency
-        cmd += ["-sS", "-A", "-O", "-Pn"]
+        # prefer raw SYN if possible, otherwise TCP connect
+        if can_do_sS:
+            cmd += ["-sS", "-A", "-O"]   # -A (aggressive) does version, scripts, traceroute, etc
+        else:
+            logging.warning("Not root / no raw-socket capability: falling back to -sT for aggressive nmap.")
+            cmd += ["-sT", "-A", "-O"]
     else:
-        cmd += ["-sV", "--version-intensity", "0", "-Pn"]
+        # non-aggressive: do service/version detection
+        cmd += ["-sV", "--version-intensity", "0"]
+
     cmd.append(target)
 
-    logging.info("Running nmap: %s", " ".join(cmd))
+    logging.info("Executing nmap command: %s", " ".join(cmd))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        out = proc.stdout or ""
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        output = proc.stdout or ""
         if proc.returncode != 0:
-            out = out + ("\n\n# nmap stderr:\n" + (proc.stderr or ""))
-            logging.warning("nmap returned non-zero exit status %s", proc.returncode)
-        return out
-    except Exception as e:
-        logging.error("Error running nmap: %s", e)
+            output += "\n\n# nmap stderr:\n" + (proc.stderr or "")
+            logging.warning("nmap exited with code %s", proc.returncode)
+        return output
+    except subprocess.TimeoutExpired:
+        logging.error("nmap command timed out after %s seconds", timeout)
+        return None
+    except Exception as exc:
+        logging.exception("Exception while running nmap: %s", exc)
         return None
 
 def parse_nmap_aggressive(nmap_output: str) -> Dict[str, Any]:
