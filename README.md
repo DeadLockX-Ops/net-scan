@@ -214,5 +214,4 @@ Contributions, pull requests and issues are welcome. Please follow these rules:
 3. Send a pull request with tests and documentation when appropriate.
 
 
-Choose and add an appropriate license for your project (e.g., MIT, Apache-2.0). Example:
 
